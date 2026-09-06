@@ -11,8 +11,8 @@ A built binary reports its own version with `dns-updater -version`, and logs it 
 ### Added
 
 - `-retry-interval` (default 30s). A cycle that cannot read the external IP now comes back
-  after this interval instead of waiting out the full `-interval`. A failed read means the
-  network is down and the records are stale until it returns. A failed *write* keeps the
+  after this interval instead of waiting out the full `-interval`, which left records stale
+  for a whole interval after a network outage. A failed *write* keeps the
   normal interval, because it can be a permanent fault such as an absent record or a
   read-only token, and retrying that every few seconds would not fix it.
 - `-version`, and a version line at startup, so a running instance names its own build.
@@ -21,9 +21,7 @@ A built binary reports its own version with `dns-updater -version`, and logs it 
 
 ## [1.0.0] - 2026-09-06
 
-First version in service. It owns `mail.alkallio.com` on the Fedora host and was proved
-against a real ISP lease change the same day: the address changed while the router was down,
-and the record followed with no human involved.
+First version in service.
 
 ### Added
 
