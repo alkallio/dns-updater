@@ -33,3 +33,6 @@ go.work.sum
 
 domains.json
 dns-updater
+
+# Built binary
+/dns-updater

@@ -92,8 +92,29 @@ go run .
 | --- | --- | --- |
 | `-config` | `domains.json` | Path to the configuration file |
 | `-interval` | `5m` | How often to check the external IP |
+| `-retry-interval` | `30s` | How soon to retry after the external IP could not be read |
+| `-version` | | Print the version and exit |
 
 The tool runs until stopped. It reads its configuration once, at startup.
+
+## Build and versions
+
+```bash
+make build     # builds ./dns-updater, stamped with the version
+make test      # gofmt, go vet, go test
+make install   # replaces the binary in the instance directory
+```
+
+`make build` takes the version from `git describe`, so a binary always names a release and a
+build from uncommitted work is marked `-dirty`. A plain `go build` still identifies itself,
+from the VCS data the Go toolchain stamps in.
+
+```bash
+./dns-updater -version     # what this binary is
+```
+
+A running instance logs its version on the first line at startup, so the journal answers the
+same question. Changes by version are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Limitations
 
