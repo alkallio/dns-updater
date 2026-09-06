@@ -23,6 +23,12 @@ const (
 	defaultIPFetchInterval = 5 * time.Minute
 	defaultConfigFilePath  = "domains.json"
 
+	// defaultRetryInterval is the wait after a cycle that could not read the
+	// external IP at all. A failed read usually means the network is down, and
+	// the records stay stale until it returns, so come back sooner than the
+	// normal interval rather than waiting it out.
+	defaultRetryInterval = 30 * time.Second
+
 	// defaultIPFetchTimeout bounds a single request to an IP reporting service.
 	// Without it a half-open connection stalls the check loop indefinitely.
 	defaultIPFetchTimeout = 15 * time.Second
@@ -89,7 +95,17 @@ type GCPDNSUpdater struct {
 func main() {
 	configPath := flag.String("config", defaultConfigFilePath, "path to the domains configuration file")
 	interval := flag.Duration("interval", defaultIPFetchInterval, "how often to check the external IP")
+	retryInterval := flag.Duration("retry-interval", defaultRetryInterval, "how soon to retry after the external IP could not be read")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
+
+	// Log the version first, so the journal always says which build is running.
+	log.Printf("dns-updater %s starting", versionString())
 
 	// Load configuration first: which provider clients we need depends on it.
 	config, err := LoadConfig(*configPath)
@@ -121,17 +137,17 @@ func main() {
 
 	lastKnownIPs := make(map[string]string)
 
-	// Main DNS update loop
-	ticker := time.NewTicker(*interval)
-	defer ticker.Stop()
+	log.Printf("Starting DNS monitoring loop. Checking every %v, retrying after %v if the IP cannot be read", *interval, *retryInterval)
 
-	log.Printf("Starting DNS monitoring loop. Checking every %v", *interval)
-
-	// Do first check immediately
-	performCheck(config, ipFetcher, updaters, lastKnownIPs, *interval)
-
-	for range ticker.C {
-		performCheck(config, ipFetcher, updaters, lastKnownIPs, *interval)
+	// The wait is chosen after each cycle rather than by a fixed ticker, so a
+	// cycle that could not read the IP comes back sooner.
+	for {
+		wait := *interval
+		if !performCheck(config, ipFetcher, updaters, lastKnownIPs) {
+			wait = *retryInterval
+		}
+		log.Printf("Next check in %v", wait)
+		time.Sleep(wait)
 	}
 }
 
@@ -231,18 +247,24 @@ func resolveUpdater(rec DomainConfig, updaters map[string]DNSUpdater) (DNSUpdate
 
 // performCheck performs a single DNS update check. The external IP is fetched
 // once per address family and reused across every record of that family.
-func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUpdater, lastKnownIPs map[string]string, interval time.Duration) {
+//
+// It reports whether every address the configuration needs could be read. A
+// false result means the IP is unknown and the records may be stale, which the
+// caller uses to come back sooner. A provider write that fails does not change
+// the result: that can be a permanent fault, such as an absent record or a
+// read-only token, and retrying it every few seconds would not fix it.
+func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUpdater, lastKnownIPs map[string]string) bool {
 	log.Println("Starting DNS check cycle...")
 
 	domainConfigs := config.GetDomains()
 	if len(domainConfigs) == 0 {
 		log.Println("No domains configured. Waiting for next check...")
-		log.Printf("DNS check cycle completed. Next check in %v", interval)
-		return
+		return true
 	}
 
 	// Cache one address per record type for the duration of this cycle.
 	ipsByType := make(map[string]string)
+	addressesRead := true
 
 	for _, domainConfig := range domainConfigs {
 		updater, err := resolveUpdater(domainConfig, updaters)
@@ -256,6 +278,7 @@ func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUp
 			currentIP, err = ipFetcher.GetExternalIP(domainConfig.RecordType)
 			if err != nil {
 				log.Printf("Error fetching external IP for %s: %v", domainConfig.RecordName, err)
+				addressesRead = false
 				continue
 			}
 			ipsByType[domainConfig.RecordType] = currentIP
@@ -265,7 +288,8 @@ func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUp
 		processRecord(domainConfig, currentIP, lastKnownIPs, updater)
 	}
 
-	log.Printf("DNS check cycle completed. Next check in %v", interval)
+	log.Println("DNS check cycle completed.")
+	return addressesRead
 }
 
 // extractProjectID extracts the project ID from service account JSON

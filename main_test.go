@@ -506,3 +506,71 @@ func TestFetchIPFromRejectsError(t *testing.T) {
 		t.Error("fetchIPFrom should reject a non-200 response")
 	}
 }
+
+// MockIPFetcher is a mock implementation of IPFetcher for testing.
+type MockIPFetcher struct {
+	IP  string
+	Err error
+}
+
+func (m *MockIPFetcher) GetExternalIP(recordType string) (string, error) {
+	if m.Err != nil {
+		return "", m.Err
+	}
+	return m.IP, nil
+}
+
+// TestPerformCheckSignalsRetry covers the retry signal: a cycle that cannot
+// read the external IP must ask to come back sooner, and a cycle that reads it
+// must not.
+func TestPerformCheckSignalsRetry(t *testing.T) {
+	config := NewConfig()
+	config.AddDomain(DomainConfig{
+		Provider:   ProviderCloudflare,
+		ZoneName:   "zone123",
+		RecordName: "mail.example.com.",
+		RecordType: "A",
+		TTL:        300,
+	})
+	updaters := map[string]DNSUpdater{
+		ProviderCloudflare: &MockDNSUpdater{
+			GetCurrentIPFunc: func(rec DomainConfig) (string, error) { return "1.2.3.4", nil },
+			UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error { return nil },
+		},
+	}
+
+	t.Run("IP unreadable asks for a retry", func(t *testing.T) {
+		fetcher := &MockIPFetcher{Err: fmt.Errorf("network is unreachable")}
+		if performCheck(config, fetcher, updaters, map[string]string{}) {
+			t.Error("a cycle that cannot read the IP must ask to come back sooner")
+		}
+	})
+
+	t.Run("IP readable keeps the normal interval", func(t *testing.T) {
+		fetcher := &MockIPFetcher{IP: "1.2.3.4"}
+		if !performCheck(config, fetcher, updaters, map[string]string{}) {
+			t.Error("a cycle that read the IP must keep the normal interval")
+		}
+	})
+
+	t.Run("a failed write keeps the normal interval", func(t *testing.T) {
+		failing := map[string]DNSUpdater{
+			ProviderCloudflare: &MockDNSUpdater{
+				GetCurrentIPFunc: func(rec DomainConfig) (string, error) { return "9.9.9.9", nil },
+				UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error {
+					return fmt.Errorf("no such record")
+				},
+			},
+		}
+		fetcher := &MockIPFetcher{IP: "1.2.3.4"}
+		if !performCheck(config, fetcher, failing, map[string]string{}) {
+			t.Error("a failed write can be permanent and must not trigger fast retries")
+		}
+	})
+
+	t.Run("no domains keeps the normal interval", func(t *testing.T) {
+		if !performCheck(NewConfig(), &MockIPFetcher{IP: "1.2.3.4"}, updaters, map[string]string{}) {
+			t.Error("an empty configuration is not a retry condition")
+		}
+	})
+}
