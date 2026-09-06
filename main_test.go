@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -89,20 +91,20 @@ func TestExtractProjectID(t *testing.T) {
 
 // MockDNSUpdater is a mock implementation of DNSUpdater for testing
 type MockDNSUpdater struct {
-	GetCurrentIPFunc func(projectID, zoneName, recordName, recordType string) (string, error)
-	UpdateRecordFunc func(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error
+	GetCurrentIPFunc func(rec DomainConfig) (string, error)
+	UpdateRecordFunc func(rec DomainConfig, ipAddress string) error
 }
 
-func (m *MockDNSUpdater) GetCurrentDNSRecordIP(projectID, zoneName, recordName, recordType string) (string, error) {
+func (m *MockDNSUpdater) GetCurrentDNSRecordIP(rec DomainConfig) (string, error) {
 	if m.GetCurrentIPFunc != nil {
-		return m.GetCurrentIPFunc(projectID, zoneName, recordName, recordType)
+		return m.GetCurrentIPFunc(rec)
 	}
 	return "", fmt.Errorf("not implemented")
 }
 
-func (m *MockDNSUpdater) UpdateDNSRecord(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+func (m *MockDNSUpdater) UpdateDNSRecord(rec DomainConfig, ipAddress string) error {
 	if m.UpdateRecordFunc != nil {
-		return m.UpdateRecordFunc(projectID, zoneName, recordName, recordType, ipAddress, ttl)
+		return m.UpdateRecordFunc(rec, ipAddress)
 	}
 	return fmt.Errorf("not implemented")
 }
@@ -162,70 +164,65 @@ ts=1762166320.116`,
 
 // TestProcessRecord tests the core business logic for DNS updates
 func TestProcessRecord(t *testing.T) {
-	projectID := "test-project"
 	config := DomainConfig{
+		Provider:   ProviderGCP,
 		ZoneName:   "example-zone",
 		RecordName: "test.example.com.",
 		RecordType: "A",
 		TTL:        300,
 	}
+	key := config.Key()
 
 	t.Run("No change - current IP equals last known IP", func(t *testing.T) {
-		lastKnownIPs := map[string]string{
-			"test.example.com.": "1.2.3.4",
-		}
+		lastKnownIPs := map[string]string{key: "1.2.3.4"}
 		currentIP := "1.2.3.4"
 
 		mock := &MockDNSUpdater{}
 		// No functions should be called
 
-		processRecord(projectID, config, currentIP, lastKnownIPs, mock)
+		processRecord(config, currentIP, lastKnownIPs, mock)
 
 		// Verify lastKnownIPs unchanged
-		if lastKnownIPs["test.example.com."] != "1.2.3.4" {
+		if lastKnownIPs[key] != "1.2.3.4" {
 			t.Errorf("lastKnownIPs should remain unchanged")
 		}
 	})
 
 	t.Run("DNS matches - no update needed but update lastKnownIPs", func(t *testing.T) {
-		lastKnownIPs := map[string]string{
-			"test.example.com.": "1.2.3.4",
-		}
+		lastKnownIPs := map[string]string{key: "1.2.3.4"}
 		currentIP := "5.6.7.8"
 
 		updateCalled := false
 		mock := &MockDNSUpdater{
-			GetCurrentIPFunc: func(projectID, zoneName, recordName, recordType string) (string, error) {
+			GetCurrentIPFunc: func(rec DomainConfig) (string, error) {
 				return "5.6.7.8", nil // DNS already has the current IP
 			},
-			UpdateRecordFunc: func(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+			UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error {
 				updateCalled = true
 				return nil
 			},
 		}
 
-		processRecord(projectID, config, currentIP, lastKnownIPs, mock)
+		processRecord(config, currentIP, lastKnownIPs, mock)
 
 		if updateCalled {
 			t.Error("UpdateDNSRecord should not be called when DNS already matches")
 		}
-		if lastKnownIPs["test.example.com."] != "5.6.7.8" {
-			t.Errorf("lastKnownIPs should be updated to %q, got %q", "5.6.7.8", lastKnownIPs["test.example.com."])
+		if lastKnownIPs[key] != "5.6.7.8" {
+			t.Errorf("lastKnownIPs should be updated to %q, got %q", "5.6.7.8", lastKnownIPs[key])
 		}
 	})
 
 	t.Run("Update needed - successful DNS update", func(t *testing.T) {
-		lastKnownIPs := map[string]string{
-			"test.example.com.": "1.2.3.4",
-		}
+		lastKnownIPs := map[string]string{key: "1.2.3.4"}
 		currentIP := "5.6.7.8"
 
 		updateCalled := false
 		mock := &MockDNSUpdater{
-			GetCurrentIPFunc: func(projectID, zoneName, recordName, recordType string) (string, error) {
+			GetCurrentIPFunc: func(rec DomainConfig) (string, error) {
 				return "1.2.3.4", nil // DNS has old IP
 			},
-			UpdateRecordFunc: func(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+			UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error {
 				updateCalled = true
 				if ipAddress != "5.6.7.8" {
 					t.Errorf("UpdateDNSRecord called with IP %q, want %q", ipAddress, "5.6.7.8")
@@ -234,13 +231,13 @@ func TestProcessRecord(t *testing.T) {
 			},
 		}
 
-		processRecord(projectID, config, currentIP, lastKnownIPs, mock)
+		processRecord(config, currentIP, lastKnownIPs, mock)
 
 		if !updateCalled {
 			t.Error("UpdateDNSRecord should be called")
 		}
-		if lastKnownIPs["test.example.com."] != "5.6.7.8" {
-			t.Errorf("lastKnownIPs should be updated to %q, got %q", "5.6.7.8", lastKnownIPs["test.example.com."])
+		if lastKnownIPs[key] != "5.6.7.8" {
+			t.Errorf("lastKnownIPs should be updated to %q, got %q", "5.6.7.8", lastKnownIPs[key])
 		}
 	})
 
@@ -250,44 +247,180 @@ func TestProcessRecord(t *testing.T) {
 
 		updateCalled := false
 		mock := &MockDNSUpdater{
-			GetCurrentIPFunc: func(projectID, zoneName, recordName, recordType string) (string, error) {
+			GetCurrentIPFunc: func(rec DomainConfig) (string, error) {
 				return "", fmt.Errorf("DNS lookup failed")
 			},
-			UpdateRecordFunc: func(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+			UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error {
 				updateCalled = true
 				return nil
 			},
 		}
 
-		processRecord(projectID, config, currentIP, lastKnownIPs, mock)
+		processRecord(config, currentIP, lastKnownIPs, mock)
 
 		if !updateCalled {
 			t.Error("UpdateDNSRecord should be called even when DNS lookup fails")
 		}
-		if lastKnownIPs["test.example.com."] != "5.6.7.8" {
+		if lastKnownIPs[key] != "5.6.7.8" {
 			t.Errorf("lastKnownIPs should be updated after successful update")
 		}
 	})
 
 	t.Run("DNS update fails - do not update lastKnownIPs", func(t *testing.T) {
-		lastKnownIPs := map[string]string{
-			"test.example.com.": "1.2.3.4",
-		}
+		lastKnownIPs := map[string]string{key: "1.2.3.4"}
 		currentIP := "5.6.7.8"
 
 		mock := &MockDNSUpdater{
-			GetCurrentIPFunc: func(projectID, zoneName, recordName, recordType string) (string, error) {
+			GetCurrentIPFunc: func(rec DomainConfig) (string, error) {
 				return "1.2.3.4", nil
 			},
-			UpdateRecordFunc: func(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+			UpdateRecordFunc: func(rec DomainConfig, ipAddress string) error {
 				return fmt.Errorf("update failed")
 			},
 		}
 
-		processRecord(projectID, config, currentIP, lastKnownIPs, mock)
+		processRecord(config, currentIP, lastKnownIPs, mock)
 
-		if lastKnownIPs["test.example.com."] != "1.2.3.4" {
-			t.Errorf("lastKnownIPs should NOT be updated when update fails, got %q", lastKnownIPs["test.example.com."])
+		if lastKnownIPs[key] != "1.2.3.4" {
+			t.Errorf("lastKnownIPs should NOT be updated when update fails, got %q", lastKnownIPs[key])
 		}
 	})
+}
+
+// TestDomainConfigKey verifies that records differing only by provider or zone
+// get distinct keys, so their last known IPs do not collide.
+func TestDomainConfigKey(t *testing.T) {
+	gcp := DomainConfig{Provider: ProviderGCP, ZoneName: "z1", RecordName: "a.example.com.", RecordType: "A"}
+	cf := DomainConfig{Provider: ProviderCloudflare, ZoneName: "z1", RecordName: "a.example.com.", RecordType: "A"}
+	aaaa := DomainConfig{Provider: ProviderGCP, ZoneName: "z1", RecordName: "a.example.com.", RecordType: "AAAA"}
+
+	if gcp.Key() == cf.Key() {
+		t.Error("records from different providers must not share a key")
+	}
+	if gcp.Key() == aaaa.Key() {
+		t.Error("records of different types must not share a key")
+	}
+}
+
+// TestCloudflareRecordName checks that the GCP trailing dot is stripped.
+func TestCloudflareRecordName(t *testing.T) {
+	tests := map[string]string{
+		"sub.example.com.": "sub.example.com",
+		"sub.example.com":  "sub.example.com",
+		"example.com.":     "example.com",
+	}
+	for input, want := range tests {
+		if got := cloudflareRecordName(input); got != want {
+			t.Errorf("cloudflareRecordName(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+// TestCloudflareTTL checks that proxied records force the automatic TTL.
+func TestCloudflareTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  DomainConfig
+		want int64
+	}{
+		{"explicit TTL", DomainConfig{TTL: 300}, 300},
+		{"proxied forces auto", DomainConfig{TTL: 300, Proxied: true}, cloudflareAutoTTL},
+		{"zero TTL means auto", DomainConfig{TTL: 0}, cloudflareAutoTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cloudflareTTL(tt.rec); got != tt.want {
+				t.Errorf("cloudflareTTL() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDomainConfigJSONTags verifies that the snake_case keys documented in the
+// README actually populate the struct.
+func TestDomainConfigJSONTags(t *testing.T) {
+	input := []byte(`{"provider":"cloudflare","zone_name":"abc123","record_name":"sub.example.com.","record_type":"A","ttl":300,"proxied":true}`)
+	var got DomainConfig
+	if err := json.Unmarshal(input, &got); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	want := DomainConfig{Provider: "cloudflare", ZoneName: "abc123", RecordName: "sub.example.com.", RecordType: "A", TTL: 300, Proxied: true}
+	if got != want {
+		t.Errorf("parsed %+v, want %+v", got, want)
+	}
+}
+
+// TestProviderFor checks the strict provider policy: only known providers are
+// accepted, and a missing field is an error rather than a default.
+func TestProviderFor(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		want      string
+		wantError bool
+	}{
+		{"gcp", ProviderGCP, ProviderGCP, false},
+		{"cloudflare", ProviderCloudflare, ProviderCloudflare, false},
+		{"missing", "", "", true},
+		{"unknown", "route53", "", true},
+		{"wrong case", "GCP", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := providerFor(DomainConfig{Provider: tt.provider})
+			if (err != nil) != tt.wantError {
+				t.Fatalf("providerFor(%q) error = %v, wantError %v", tt.provider, err, tt.wantError)
+			}
+			if got != tt.want {
+				t.Errorf("providerFor(%q) = %q, want %q", tt.provider, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildUpdatersRejectsBadProvider verifies that a bad provider fails at
+// startup instead of surfacing later as a skipped record.
+func TestBuildUpdatersRejectsBadProvider(t *testing.T) {
+	domains := []DomainConfig{{Provider: "route53", RecordName: "a.example.com."}}
+	if _, err := buildUpdaters(context.Background(), domains, nil); err == nil {
+		t.Error("buildUpdaters should reject an unknown provider")
+	}
+}
+
+// TestBuildUpdatersNoGCPKey verifies that a gcp record without a service
+// account key argument is reported as a usage error.
+func TestBuildUpdatersNoGCPKey(t *testing.T) {
+	domains := []DomainConfig{{Provider: ProviderGCP, RecordName: "a.example.com."}}
+	if _, err := buildUpdaters(context.Background(), domains, nil); err == nil {
+		t.Error("buildUpdaters should require a service account key for gcp records")
+	}
+}
+
+// TestBuildUpdatersNoCloudflareToken verifies that a cloudflare record without
+// a token is reported at startup.
+func TestBuildUpdatersNoCloudflareToken(t *testing.T) {
+	t.Setenv(cloudflareTokenEnv, "")
+	domains := []DomainConfig{{Provider: ProviderCloudflare, RecordName: "a.example.com."}}
+	if _, err := buildUpdaters(context.Background(), domains, nil); err == nil {
+		t.Error("buildUpdaters should require CLOUDFLARE_API_TOKEN for cloudflare records")
+	}
+}
+
+// TestBuildUpdatersCloudflareOnly verifies that a cloudflare-only config needs
+// no GCP service account key.
+func TestBuildUpdatersCloudflareOnly(t *testing.T) {
+	t.Setenv(cloudflareTokenEnv, "test-token")
+	domains := []DomainConfig{{Provider: ProviderCloudflare, RecordName: "a.example.com."}}
+
+	updaters, err := buildUpdaters(context.Background(), domains, nil)
+	if err != nil {
+		t.Fatalf("buildUpdaters() error = %v", err)
+	}
+	if _, ok := updaters[ProviderGCP]; ok {
+		t.Error("GCP client should not be initialized for a cloudflare-only config")
+	}
+	if _, ok := updaters[ProviderCloudflare]; !ok {
+		t.Error("cloudflare client should be initialized")
+	}
 }

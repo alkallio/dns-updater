@@ -27,12 +27,27 @@ type serviceAccount struct {
 	ProjectID string `json:"project_id"`
 }
 
+// Provider identifiers used by the "provider" field in domains.json.
+const (
+	ProviderGCP        = "gcp"
+	ProviderCloudflare = "cloudflare"
+)
+
 // DomainConfig holds configuration for a DNS record
 type DomainConfig struct {
-	ZoneName   string // GCP DNS Zone name
-	RecordName string // FQDN of the record, e.g., "sub.example.com." (note the trailing dot)
-	RecordType string // e.g., "A", "AAAA"
-	TTL        int64  // Time-to-live for the DNS record in seconds
+	Provider   string `json:"provider"`    // "gcp" or "cloudflare"
+	ZoneName   string `json:"zone_name"`   // GCP managed zone name, or Cloudflare zone ID
+	RecordName string `json:"record_name"` // FQDN of the record, e.g., "sub.example.com."
+	RecordType string `json:"record_type"` // e.g., "A", "AAAA"
+	TTL        int64  `json:"ttl"`         // Time-to-live for the DNS record in seconds
+	Proxied    bool   `json:"proxied"`     // Cloudflare only: route the record through the CF proxy
+}
+
+// Key returns a unique identifier for this record, used to track the last
+// known IP per record. Provider and zone are included because the same record
+// name can exist in more than one provider or zone.
+func (d DomainConfig) Key() string {
+	return strings.Join([]string{d.Provider, d.ZoneName, d.RecordName, d.RecordType}, "|")
 }
 
 // IPFetcher interface for fetching external IP addresses
@@ -40,10 +55,12 @@ type IPFetcher interface {
 	GetExternalIP() (string, error)
 }
 
-// DNSUpdater interface for DNS operations
+// DNSUpdater interface for DNS operations. Provider credentials and any
+// account-level identifiers (such as the GCP project ID) belong to the
+// implementation, not to these signatures.
 type DNSUpdater interface {
-	GetCurrentDNSRecordIP(projectID, zoneName, recordName, recordType string) (string, error)
-	UpdateDNSRecord(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error
+	GetCurrentDNSRecordIP(rec DomainConfig) (string, error)
+	UpdateDNSRecord(rec DomainConfig, ipAddress string) error
 }
 
 // HTTPIPFetcher implements IPFetcher using HTTP requests
@@ -53,54 +70,30 @@ type HTTPIPFetcher struct {
 
 // GCPDNSUpdater implements DNSUpdater using GCP DNS API
 type GCPDNSUpdater struct {
-	Service *dns.Service
+	Service   *dns.Service
+	ProjectID string
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <path_to_service_account_key.json>", os.Args[0])
-	}
-	saKeyPath := os.Args[1]
-
-	saKeyBytes, err := os.ReadFile(saKeyPath)
-	if err != nil {
-		log.Fatalf("Failed to read service account key file: %v", err)
-	}
-
-	projectID, err := extractProjectID(saKeyBytes)
-	if err != nil {
-		log.Fatalf("Failed to extract project ID: %v", err)
-	}
-	log.Printf("Using Project ID: %s", projectID)
-
-	// Authenticate using the service account
-	ctx := context.Background()
-	creds, err := google.CredentialsFromJSON(ctx, saKeyBytes, dns.NdevClouddnsReadwriteScope)
-	if err != nil {
-		log.Fatalf("Failed to create credentials from service account key: %v", err)
-	}
-
-	dnsService, err := dns.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		log.Fatalf("Failed to create DNS service client: %v", err)
-	}
-
-	log.Printf("Successfully authenticated and created DNS service client for project %s", projectID)
-
-	// Load configuration from file
+	// Load configuration first: which provider clients we need depends on it.
 	config, err := LoadConfig(configFilePath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// If config file is empty, create it
-	if len(config.GetDomains()) == 0 {
+	domainConfigs := config.GetDomains()
+	if len(domainConfigs) == 0 {
 		log.Printf("No domains configured in %s. Please add domain configurations to begin DNS updates.", configFilePath)
 		if err := config.SaveConfig(configFilePath); err != nil {
 			log.Printf("Warning: Failed to save configuration file: %v", err)
 		}
 	} else {
-		log.Printf("Loaded %d domain(s) from configuration file", len(config.GetDomains()))
+		log.Printf("Loaded %d domain(s) from configuration file", len(domainConfigs))
+	}
+
+	updaters, err := buildUpdaters(context.Background(), domainConfigs, os.Args[1:])
+	if err != nil {
+		log.Fatalf("Failed to initialize DNS providers: %v", err)
 	}
 
 	ipFetcher := &HTTPIPFetcher{
@@ -109,7 +102,6 @@ func main() {
 			"https://ipecho.net/plain",
 		},
 	}
-	dnsUpdater := &GCPDNSUpdater{Service: dnsService}
 
 	lastKnownIPs := make(map[string]string)
 
@@ -120,15 +112,109 @@ func main() {
 	log.Printf("Starting DNS monitoring loop. Checking every %v", ipFetchInterval)
 
 	// Do first check immediately
-	performCheck(projectID, config, ipFetcher, dnsUpdater, lastKnownIPs)
+	performCheck(config, ipFetcher, updaters, lastKnownIPs)
 
 	for range ticker.C {
-		performCheck(projectID, config, ipFetcher, dnsUpdater, lastKnownIPs)
+		performCheck(config, ipFetcher, updaters, lastKnownIPs)
 	}
 }
 
+// buildUpdaters creates one DNSUpdater per provider referenced by the
+// configuration. A provider that no record uses is never initialized, so a
+// Cloudflare-only setup needs no GCP service account key and vice versa.
+func buildUpdaters(ctx context.Context, domains []DomainConfig, args []string) (map[string]DNSUpdater, error) {
+	needed := make(map[string]bool)
+	for _, d := range domains {
+		provider, err := providerFor(d)
+		if err != nil {
+			return nil, fmt.Errorf("record %s: %w", d.RecordName, err)
+		}
+		needed[provider] = true
+	}
+
+	updaters := make(map[string]DNSUpdater)
+
+	if needed[ProviderGCP] {
+		if len(args) < 1 {
+			return nil, fmt.Errorf("configuration contains %q records; usage: %s <path_to_service_account_key.json>", ProviderGCP, os.Args[0])
+		}
+		updater, err := newGCPDNSUpdater(ctx, args[0])
+		if err != nil {
+			return nil, err
+		}
+		updaters[ProviderGCP] = updater
+	}
+
+	if needed[ProviderCloudflare] {
+		updater, err := NewCloudflareDNSUpdater(os.Getenv(cloudflareTokenEnv))
+		if err != nil {
+			return nil, err
+		}
+		updaters[ProviderCloudflare] = updater
+		log.Println("Cloudflare DNS client ready")
+	}
+
+	return updaters, nil
+}
+
+// newGCPDNSUpdater authenticates with the given service account key file.
+func newGCPDNSUpdater(ctx context.Context, saKeyPath string) (*GCPDNSUpdater, error) {
+	saKeyBytes, err := os.ReadFile(saKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read service account key file: %w", err)
+	}
+
+	projectID, err := extractProjectID(saKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract project ID: %w", err)
+	}
+
+	creds, err := google.CredentialsFromJSON(ctx, saKeyBytes, dns.NdevClouddnsReadwriteScope)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create credentials from service account key: %w", err)
+	}
+
+	dnsService, err := dns.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DNS service client: %w", err)
+	}
+
+	log.Printf("GCP DNS client ready for project %s", projectID)
+	return &GCPDNSUpdater{Service: dnsService, ProjectID: projectID}, nil
+}
+
+// providerFor returns the provider name to use for a record. It is the single
+// place that decides how a missing or unknown "provider" field is treated, so
+// that buildUpdaters and resolveUpdater can never disagree.
+//
+// The policy is strict: every record names a supported provider, or startup
+// fails. A typo becomes an error instead of a silently skipped record.
+func providerFor(rec DomainConfig) (string, error) {
+	switch rec.Provider {
+	case ProviderGCP, ProviderCloudflare:
+		return rec.Provider, nil
+	case "":
+		return "", fmt.Errorf("missing %q field, expected %q or %q", "provider", ProviderGCP, ProviderCloudflare)
+	default:
+		return "", fmt.Errorf("unknown provider %q, expected %q or %q", rec.Provider, ProviderGCP, ProviderCloudflare)
+	}
+}
+
+// resolveUpdater picks the DNSUpdater for a record.
+func resolveUpdater(rec DomainConfig, updaters map[string]DNSUpdater) (DNSUpdater, error) {
+	provider, err := providerFor(rec)
+	if err != nil {
+		return nil, err
+	}
+	updater, ok := updaters[provider]
+	if !ok {
+		return nil, fmt.Errorf("no client initialized for provider %q", provider)
+	}
+	return updater, nil
+}
+
 // performCheck performs a single DNS update check
-func performCheck(projectID string, config *Config, ipFetcher IPFetcher, dnsUpdater DNSUpdater, lastKnownIPs map[string]string) {
+func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUpdater, lastKnownIPs map[string]string) {
 	log.Println("Starting DNS check cycle...")
 
 	currentIP, err := ipFetcher.GetExternalIP()
@@ -150,7 +236,12 @@ func performCheck(projectID string, config *Config, ipFetcher IPFetcher, dnsUpda
 		log.Println("No domains configured. Waiting for next check...")
 	} else {
 		for _, domainConfig := range domainConfigs {
-			processRecord(projectID, domainConfig, currentIP, lastKnownIPs, dnsUpdater)
+			updater, err := resolveUpdater(domainConfig, updaters)
+			if err != nil {
+				log.Printf("Skipping %s: %v", domainConfig.RecordName, err)
+				continue
+			}
+			processRecord(domainConfig, currentIP, lastKnownIPs, updater)
 		}
 	}
 
@@ -171,9 +262,10 @@ func extractProjectID(saKeyBytes []byte) (string, error) {
 
 // processRecord handles the DNS update logic for a single domain configuration
 // This function is extracted for testability and contains the core business logic
-func processRecord(projectID string, config DomainConfig, currentIP string, lastKnownIPs map[string]string, dnsUpdater DNSUpdater) {
-	log.Printf("Processing record: %s (Zone: %s, Type: %s)", config.RecordName, config.ZoneName, config.RecordType)
-	lastKnownIP := lastKnownIPs[config.RecordName]
+func processRecord(config DomainConfig, currentIP string, lastKnownIPs map[string]string, dnsUpdater DNSUpdater) {
+	log.Printf("Processing record: %s (Provider: %s, Zone: %s, Type: %s)", config.RecordName, config.Provider, config.ZoneName, config.RecordType)
+	key := config.Key()
+	lastKnownIP := lastKnownIPs[key]
 
 	if currentIP == lastKnownIP {
 		log.Printf("IP address (%s) for %s has not changed. No update needed.", currentIP, config.RecordName)
@@ -182,26 +274,26 @@ func processRecord(projectID string, config DomainConfig, currentIP string, last
 
 	log.Printf("External IP (%s) differs from last known IP ('%s') for %s. Checking DNS.", currentIP, lastKnownIP, config.RecordName)
 
-	currentDNSRecordIP, err := dnsUpdater.GetCurrentDNSRecordIP(projectID, config.ZoneName, config.RecordName, config.RecordType)
+	currentDNSRecordIP, err := dnsUpdater.GetCurrentDNSRecordIP(config)
 	if err != nil {
 		log.Printf("Warning: Could not get current DNS record IP for %s: %v. Proceeding with update attempt.", config.RecordName, err)
 	} else {
 		log.Printf("Current DNS %s record IP for %s: %s", config.RecordType, config.RecordName, currentDNSRecordIP)
 		if currentIP == currentDNSRecordIP {
 			log.Printf("External IP (%s) matches current DNS record IP for %s. No update needed.", currentIP, config.RecordName)
-			lastKnownIPs[config.RecordName] = currentIP
+			lastKnownIPs[key] = currentIP
 			return
 		}
 	}
 
 	log.Printf("Attempting DNS update for %s to IP %s.", config.RecordName, currentIP)
-	err = dnsUpdater.UpdateDNSRecord(projectID, config.ZoneName, config.RecordName, config.RecordType, currentIP, config.TTL)
+	err = dnsUpdater.UpdateDNSRecord(config, currentIP)
 	if err != nil {
 		log.Printf("Error updating DNS record for %s: %v", config.RecordName, err)
 		return
 	}
 	log.Printf("Successfully updated DNS record for %s to %s", config.RecordName, currentIP)
-	lastKnownIPs[config.RecordName] = currentIP
+	lastKnownIPs[key] = currentIP
 }
 
 // GetExternalIP fetches the external IP from configured URLs
@@ -270,8 +362,9 @@ func isValidIP(ip string) bool {
 }
 
 // GetCurrentDNSRecordIP fetches the current IP from DNS record
-func (g *GCPDNSUpdater) GetCurrentDNSRecordIP(projectID, zoneName, recordName, recordType string) (string, error) {
-	listCall := g.Service.ResourceRecordSets.List(projectID, zoneName).Name(recordName).Type(recordType)
+func (g *GCPDNSUpdater) GetCurrentDNSRecordIP(rec DomainConfig) (string, error) {
+	zoneName, recordName, recordType := rec.ZoneName, rec.RecordName, rec.RecordType
+	listCall := g.Service.ResourceRecordSets.List(g.ProjectID, zoneName).Name(recordName).Type(recordType)
 	resp, err := listCall.Do()
 	if err != nil {
 		return "", fmt.Errorf("failed to list resource record sets for %s: %w", recordName, err)
@@ -289,12 +382,13 @@ func (g *GCPDNSUpdater) GetCurrentDNSRecordIP(projectID, zoneName, recordName, r
 }
 
 // UpdateDNSRecord updates a DNS record with a new IP address
-func (g *GCPDNSUpdater) UpdateDNSRecord(projectID, zoneName, recordName, recordType, ipAddress string, ttl int64) error {
+func (g *GCPDNSUpdater) UpdateDNSRecord(rec DomainConfig, ipAddress string) error {
+	zoneName, recordName, recordType, ttl := rec.ZoneName, rec.RecordName, rec.RecordType, rec.TTL
 	log.Printf("Attempting to update DNS record: Project=%s, Zone=%s, Name=%s, Type=%s, IP=%s, TTL=%d",
-		projectID, zoneName, recordName, recordType, ipAddress, ttl)
+		g.ProjectID, zoneName, recordName, recordType, ipAddress, ttl)
 
 	// Get existing records to remove the old record if it exists
-	currentRecordSet, err := g.Service.ResourceRecordSets.List(projectID, zoneName).Name(recordName).Type(recordType).Do()
+	currentRecordSet, err := g.Service.ResourceRecordSets.List(g.ProjectID, zoneName).Name(recordName).Type(recordType).Do()
 	var deletions []*dns.ResourceRecordSet
 
 	if err == nil && len(currentRecordSet.Rrsets) > 0 {
@@ -327,7 +421,7 @@ func (g *GCPDNSUpdater) UpdateDNSRecord(projectID, zoneName, recordName, recordT
 	}
 	log.Printf("Preparing to add 1 record set for %s with IP %s.", addition.Name, ipAddress)
 
-	changesCreateCall := g.Service.Changes.Create(projectID, zoneName, change)
+	changesCreateCall := g.Service.Changes.Create(g.ProjectID, zoneName, change)
 	resp, err := changesCreateCall.Do()
 	if err != nil {
 		return fmt.Errorf("failed to execute DNS change: %w", err)
@@ -344,7 +438,7 @@ func (g *GCPDNSUpdater) UpdateDNSRecord(projectID, zoneName, recordName, recordT
 			return fmt.Errorf("DNS change %s timed out after 5 minutes", resp.Id)
 		case <-ticker.C:
 			log.Printf("Waiting for DNS change to complete (ID: %s)... Current status: %s", resp.Id, resp.Status)
-			resp, err = g.Service.Changes.Get(projectID, zoneName, resp.Id).Do()
+			resp, err = g.Service.Changes.Get(g.ProjectID, zoneName, resp.Id).Do()
 			if err != nil {
 				return fmt.Errorf("failed to get status of DNS change %s: %w", resp.Id, err)
 			}
