@@ -15,10 +15,6 @@ import (
 const (
 	cloudflareAPIBase  = "https://api.cloudflare.com/client/v4"
 	cloudflareTokenEnv = "CLOUDFLARE_API_TOKEN"
-
-	// cloudflareAutoTTL is the value Cloudflare uses for "automatic" TTL. It is
-	// the only TTL accepted for proxied records.
-	cloudflareAutoTTL = 1
 )
 
 // CloudflareDNSUpdater implements DNSUpdater against the Cloudflare API v4.
@@ -26,16 +22,34 @@ const (
 type CloudflareDNSUpdater struct {
 	Token  string
 	Client *http.Client
+
+	// BaseURL overrides the API endpoint. Empty means the live API.
+	BaseURL string
 }
 
-// cfRecord is one entry of the Cloudflare DNS record API.
+// baseURL returns the API endpoint to call.
+func (c *CloudflareDNSUpdater) baseURL() string {
+	if c.BaseURL != "" {
+		return c.BaseURL
+	}
+	return cloudflareAPIBase
+}
+
+// cfRecord is one entry of the Cloudflare DNS record API, as read back.
 type cfRecord struct {
-	ID      string `json:"id,omitempty"`
+	ID      string `json:"id"`
 	Type    string `json:"type"`
 	Name    string `json:"name"`
 	Content string `json:"content"`
 	TTL     int64  `json:"ttl"`
 	Proxied bool   `json:"proxied"`
+}
+
+// cfContentPatch is the body of a content-only update. TTL and the proxy
+// setting are deliberately absent: this updater owns the value of a record and
+// nothing else, so whatever manages the zone keeps ownership of the rest.
+type cfContentPatch struct {
+	Content string `json:"content"`
 }
 
 // cfError is one entry of the Cloudflare API "errors" array.
@@ -74,7 +88,7 @@ func (c *CloudflareDNSUpdater) do(method, path string, body any) (*cfResponse, e
 		reader = bytes.NewReader(encoded)
 	}
 
-	req, err := http.NewRequest(method, cloudflareAPIBase+path, reader)
+	req, err := http.NewRequest(method, c.baseURL()+path, reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
@@ -122,15 +136,6 @@ func cloudflareRecordName(recordName string) string {
 	return strings.TrimSuffix(recordName, ".")
 }
 
-// cloudflareTTL returns the TTL to send. Cloudflare requires the automatic TTL
-// for proxied records and rejects any explicit value.
-func cloudflareTTL(rec DomainConfig) int64 {
-	if rec.Proxied || rec.TTL <= 0 {
-		return cloudflareAutoTTL
-	}
-	return rec.TTL
-}
-
 // findRecord returns the existing record matching the config, or nil if the
 // zone has no such record.
 func (c *CloudflareDNSUpdater) findRecord(rec DomainConfig) (*cfRecord, error) {
@@ -171,49 +176,28 @@ func (c *CloudflareDNSUpdater) GetCurrentDNSRecordIP(rec DomainConfig) (string, 
 }
 
 // UpdateDNSRecord points the Cloudflare record at the new IP address.
+//
+// The record must already exist. This updater changes the value of a record; it
+// does not create one, because the existence of a record belongs to whatever
+// manages the zone. An absent record is reported as an error, not repaired.
 func (c *CloudflareDNSUpdater) UpdateDNSRecord(rec DomainConfig, ipAddress string) error {
 	name := cloudflareRecordName(rec.RecordName)
-	ttl := cloudflareTTL(rec)
-
-	log.Printf("Attempting to update Cloudflare record: Zone=%s, Name=%s, Type=%s, IP=%s, TTL=%d, Proxied=%t",
-		rec.ZoneName, name, rec.RecordType, ipAddress, ttl, rec.Proxied)
 
 	existing, err := c.findRecord(rec)
 	if err != nil {
 		return err
 	}
-
-	payload := cfRecord{
-		Type:    rec.RecordType,
-		Name:    name,
-		Content: ipAddress,
-		TTL:     ttl,
-		Proxied: rec.Proxied,
-	}
-
 	if existing == nil {
-		return createCloudflareRecord(c, rec, payload)
+		return fmt.Errorf("no %s record for %s exists in cloudflare zone %s; create it in the system that owns the zone", rec.RecordType, name, rec.ZoneName)
 	}
+
+	log.Printf("Updating Cloudflare record: Zone=%s, Name=%s, Type=%s, IP=%s", rec.ZoneName, name, rec.RecordType, ipAddress)
 
 	path := fmt.Sprintf("/zones/%s/dns_records/%s", url.PathEscape(rec.ZoneName), url.PathEscape(existing.ID))
-	if _, err := c.do(http.MethodPut, path, payload); err != nil {
+	if _, err := c.do(http.MethodPatch, path, cfContentPatch{Content: ipAddress}); err != nil {
 		return fmt.Errorf("failed to update cloudflare record %s: %w", name, err)
 	}
 
 	log.Printf("Cloudflare record %s updated to %s", name, ipAddress)
-	return nil
-}
-
-// createCloudflareRecord adds a record the zone does not have yet. This matches
-// the GCP path, which also adds a record set when none exists.
-func createCloudflareRecord(c *CloudflareDNSUpdater, rec DomainConfig, payload cfRecord) error {
-	log.Printf("No existing %s record for %s in cloudflare zone %s. Creating it.", rec.RecordType, payload.Name, rec.ZoneName)
-
-	path := fmt.Sprintf("/zones/%s/dns_records", url.PathEscape(rec.ZoneName))
-	if _, err := c.do(http.MethodPost, path, payload); err != nil {
-		return fmt.Errorf("failed to create cloudflare record %s: %w", payload.Name, err)
-	}
-
-	log.Printf("Cloudflare record %s created with %s", payload.Name, payload.Content)
 	return nil
 }

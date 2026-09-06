@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2/google"
@@ -18,8 +20,12 @@ import (
 )
 
 const (
-	ipFetchInterval = 1 * time.Hour
-	configFilePath  = "domains.json"
+	defaultIPFetchInterval = 5 * time.Minute
+	defaultConfigFilePath  = "domains.json"
+
+	// defaultIPFetchTimeout bounds a single request to an IP reporting service.
+	// Without it a half-open connection stalls the check loop indefinitely.
+	defaultIPFetchTimeout = 15 * time.Second
 )
 
 // serviceAccount struct to unmarshal the project_id from the service account key
@@ -39,8 +45,7 @@ type DomainConfig struct {
 	ZoneName   string `json:"zone_name"`   // GCP managed zone name, or Cloudflare zone ID
 	RecordName string `json:"record_name"` // FQDN of the record, e.g., "sub.example.com."
 	RecordType string `json:"record_type"` // e.g., "A", "AAAA"
-	TTL        int64  `json:"ttl"`         // Time-to-live for the DNS record in seconds
-	Proxied    bool   `json:"proxied"`     // Cloudflare only: route the record through the CF proxy
+	TTL        int64  `json:"ttl"`         // Time-to-live, used by gcp; cloudflare keeps the zone's value
 }
 
 // Key returns a unique identifier for this record, used to track the last
@@ -50,9 +55,10 @@ func (d DomainConfig) Key() string {
 	return strings.Join([]string{d.Provider, d.ZoneName, d.RecordName, d.RecordType}, "|")
 }
 
-// IPFetcher interface for fetching external IP addresses
+// IPFetcher interface for fetching external IP addresses. recordType selects
+// the address family, so an A record never receives an IPv6 address.
 type IPFetcher interface {
-	GetExternalIP() (string, error)
+	GetExternalIP(recordType string) (string, error)
 }
 
 // DNSUpdater interface for DNS operations. Provider credentials and any
@@ -63,9 +69,15 @@ type DNSUpdater interface {
 	UpdateDNSRecord(rec DomainConfig, ipAddress string) error
 }
 
-// HTTPIPFetcher implements IPFetcher using HTTP requests
+// HTTPIPFetcher implements IPFetcher using HTTP requests. It holds one client
+// per address family, each pinned to that family, so the address a source
+// reports is the address this site egresses with over that protocol.
 type HTTPIPFetcher struct {
-	URLs []string
+	URLs    []string
+	Timeout time.Duration
+
+	mu      sync.Mutex
+	clients map[string]*http.Client
 }
 
 // GCPDNSUpdater implements DNSUpdater using GCP DNS API
@@ -75,23 +87,27 @@ type GCPDNSUpdater struct {
 }
 
 func main() {
+	configPath := flag.String("config", defaultConfigFilePath, "path to the domains configuration file")
+	interval := flag.Duration("interval", defaultIPFetchInterval, "how often to check the external IP")
+	flag.Parse()
+
 	// Load configuration first: which provider clients we need depends on it.
-	config, err := LoadConfig(configFilePath)
+	config, err := LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
 	domainConfigs := config.GetDomains()
 	if len(domainConfigs) == 0 {
-		log.Printf("No domains configured in %s. Please add domain configurations to begin DNS updates.", configFilePath)
-		if err := config.SaveConfig(configFilePath); err != nil {
+		log.Printf("No domains configured in %s. Please add domain configurations to begin DNS updates.", *configPath)
+		if err := config.SaveConfig(*configPath); err != nil {
 			log.Printf("Warning: Failed to save configuration file: %v", err)
 		}
 	} else {
 		log.Printf("Loaded %d domain(s) from configuration file", len(domainConfigs))
 	}
 
-	updaters, err := buildUpdaters(context.Background(), domainConfigs, os.Args[1:])
+	updaters, err := buildUpdaters(context.Background(), domainConfigs, flag.Args())
 	if err != nil {
 		log.Fatalf("Failed to initialize DNS providers: %v", err)
 	}
@@ -106,16 +122,16 @@ func main() {
 	lastKnownIPs := make(map[string]string)
 
 	// Main DNS update loop
-	ticker := time.NewTicker(ipFetchInterval)
+	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 
-	log.Printf("Starting DNS monitoring loop. Checking every %v", ipFetchInterval)
+	log.Printf("Starting DNS monitoring loop. Checking every %v", *interval)
 
 	// Do first check immediately
-	performCheck(config, ipFetcher, updaters, lastKnownIPs)
+	performCheck(config, ipFetcher, updaters, lastKnownIPs, *interval)
 
 	for range ticker.C {
-		performCheck(config, ipFetcher, updaters, lastKnownIPs)
+		performCheck(config, ipFetcher, updaters, lastKnownIPs, *interval)
 	}
 }
 
@@ -213,39 +229,43 @@ func resolveUpdater(rec DomainConfig, updaters map[string]DNSUpdater) (DNSUpdate
 	return updater, nil
 }
 
-// performCheck performs a single DNS update check
-func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUpdater, lastKnownIPs map[string]string) {
+// performCheck performs a single DNS update check. The external IP is fetched
+// once per address family and reused across every record of that family.
+func performCheck(config *Config, ipFetcher IPFetcher, updaters map[string]DNSUpdater, lastKnownIPs map[string]string, interval time.Duration) {
 	log.Println("Starting DNS check cycle...")
 
-	currentIP, err := ipFetcher.GetExternalIP()
-	if err != nil {
-		log.Printf("Error fetching external IP: %v", err)
-		return
-	}
-
-	if currentIP == "" {
-		log.Println("Could not determine external IP")
-		return
-	}
-
-	log.Printf("Current external IP: %s", currentIP)
-
-	// Get current domains from config
 	domainConfigs := config.GetDomains()
 	if len(domainConfigs) == 0 {
 		log.Println("No domains configured. Waiting for next check...")
-	} else {
-		for _, domainConfig := range domainConfigs {
-			updater, err := resolveUpdater(domainConfig, updaters)
-			if err != nil {
-				log.Printf("Skipping %s: %v", domainConfig.RecordName, err)
-				continue
-			}
-			processRecord(domainConfig, currentIP, lastKnownIPs, updater)
-		}
+		log.Printf("DNS check cycle completed. Next check in %v", interval)
+		return
 	}
 
-	log.Printf("DNS check cycle completed. Next check in %v", ipFetchInterval)
+	// Cache one address per record type for the duration of this cycle.
+	ipsByType := make(map[string]string)
+
+	for _, domainConfig := range domainConfigs {
+		updater, err := resolveUpdater(domainConfig, updaters)
+		if err != nil {
+			log.Printf("Skipping %s: %v", domainConfig.RecordName, err)
+			continue
+		}
+
+		currentIP, ok := ipsByType[domainConfig.RecordType]
+		if !ok {
+			currentIP, err = ipFetcher.GetExternalIP(domainConfig.RecordType)
+			if err != nil {
+				log.Printf("Error fetching external IP for %s: %v", domainConfig.RecordName, err)
+				continue
+			}
+			ipsByType[domainConfig.RecordType] = currentIP
+			log.Printf("Current external address for %s records: %s", domainConfig.RecordType, currentIP)
+		}
+
+		processRecord(domainConfig, currentIP, lastKnownIPs, updater)
+	}
+
+	log.Printf("DNS check cycle completed. Next check in %v", interval)
 }
 
 // extractProjectID extracts the project ID from service account JSON
@@ -296,52 +316,127 @@ func processRecord(config DomainConfig, currentIP string, lastKnownIPs map[strin
 	lastKnownIPs[key] = currentIP
 }
 
-// GetExternalIP fetches the external IP from configured URLs
-func (f *HTTPIPFetcher) GetExternalIP() (string, error) {
+// networkForRecordType maps a DNS record type to the TCP network to dial, so
+// that the address returned belongs to the family the record can hold.
+func networkForRecordType(recordType string) (string, error) {
+	switch recordType {
+	case "A":
+		return "tcp4", nil
+	case "AAAA":
+		return "tcp6", nil
+	default:
+		return "", fmt.Errorf("record type %q does not hold an IP address", recordType)
+	}
+}
+
+// matchesRecordType reports whether ip belongs to the family recordType holds.
+func matchesRecordType(ip, recordType string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	if recordType == "A" {
+		return parsed.To4() != nil
+	}
+	return parsed.To4() == nil
+}
+
+// clientFor returns the HTTP client pinned to the given network, creating it on
+// first use. Pinning the dial network is what makes a dual-stack host report
+// its IPv4 address for an A record instead of whichever family it happens to
+// prefer.
+func (f *HTTPIPFetcher) clientFor(network string) *http.Client {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.clients == nil {
+		f.clients = make(map[string]*http.Client)
+	}
+	if client, ok := f.clients[network]; ok {
+		return client
+	}
+
+	timeout := f.Timeout
+	if timeout <= 0 {
+		timeout = defaultIPFetchTimeout
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, addr)
+			},
+		},
+	}
+	f.clients[network] = client
+	return client
+}
+
+// GetExternalIP fetches the external IP for the given record type, trying each
+// configured source in turn.
+func (f *HTTPIPFetcher) GetExternalIP(recordType string) (string, error) {
+	network, err := networkForRecordType(recordType)
+	if err != nil {
+		return "", err
+	}
+	client := f.clientFor(network)
+
 	for _, url := range f.URLs {
-		log.Printf("Trying to fetch IP from: %s", url)
-		resp, err := http.Get(url)
+		log.Printf("Trying to fetch %s address from: %s", recordType, url)
+
+		ip, err := fetchIPFrom(client, url)
 		if err != nil {
 			log.Printf("Failed to get IP from %s: %v", url, err)
 			continue
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Failed to get IP from %s: status code %d", url, resp.StatusCode)
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Failed to read response body from %s: %v", url, err)
-			continue
-		}
-
-		body := string(bodyBytes)
-
-		// Check if this is a key=value format (like Cloudflare trace)
-		var ip string
-		if strings.Contains(body, "ip=") {
-			// Parse key=value format
-			ip = parseIPFromKeyValue(body)
-		} else {
-			// Treat as plain text IP
-			ip = strings.TrimSpace(body)
-		}
-
-		if ip == "" {
-			log.Printf("Could not extract IP from response from %s", url)
-			continue
-		}
-
-		if !isValidIP(ip) {
-			log.Printf("Invalid IP address format received from %s: %s", url, ip)
+		if !matchesRecordType(ip, recordType) {
+			log.Printf("Address %s from %s is not valid for a %s record", ip, url, recordType)
 			continue
 		}
 		return ip, nil
 	}
-	return "", fmt.Errorf("failed to fetch IP from all sources")
+	return "", fmt.Errorf("failed to fetch %s address from all sources", recordType)
+}
+
+// fetchIPFrom reads one IP address from a single source. It is a separate
+// function so the response body closes when this source is done, not when the
+// whole fetch loop ends.
+func fetchIPFrom(client *http.Client, url string) (string, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status code %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	body := string(bodyBytes)
+
+	// Check if this is a key=value format (like Cloudflare trace)
+	var ip string
+	if strings.Contains(body, "ip=") {
+		ip = parseIPFromKeyValue(body)
+	} else {
+		ip = strings.TrimSpace(body)
+	}
+
+	if ip == "" {
+		return "", fmt.Errorf("could not extract an IP address from the response")
+	}
+	if !isValidIP(ip) {
+		return "", fmt.Errorf("invalid IP address format: %q", ip)
+	}
+	return ip, nil
 }
 
 // parseIPFromKeyValue extracts the IP address from key=value formatted text (e.g., Cloudflare trace)
@@ -438,10 +533,13 @@ func (g *GCPDNSUpdater) UpdateDNSRecord(rec DomainConfig, ipAddress string) erro
 			return fmt.Errorf("DNS change %s timed out after 5 minutes", resp.Id)
 		case <-ticker.C:
 			log.Printf("Waiting for DNS change to complete (ID: %s)... Current status: %s", resp.Id, resp.Status)
-			resp, err = g.Service.Changes.Get(g.ProjectID, zoneName, resp.Id).Do()
+			changeID := resp.Id
+			updated, err := g.Service.Changes.Get(g.ProjectID, zoneName, changeID).Do()
 			if err != nil {
-				return fmt.Errorf("failed to get status of DNS change %s: %w", resp.Id, err)
+				// updated is nil here, so report the ID captured before the call.
+				return fmt.Errorf("failed to get status of DNS change %s: %w", changeID, err)
 			}
+			resp = updated
 		}
 	}
 

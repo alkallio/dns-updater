@@ -22,8 +22,7 @@ The tool reads `domains.json` from the working directory. Each entry names its p
       "zone_name": "023e105f4ecef8ad9ca31a8372d0c353",
       "record_name": "sub.example.org.",
       "record_type": "A",
-      "ttl": 300,
-      "proxied": false
+      "ttl": 300
     }
   ]
 }
@@ -33,8 +32,7 @@ Field meanings are in the `DomainConfig` struct in `main.go`. Two things differ 
 
 - `zone_name` holds the managed zone name for `gcp`, and the **zone ID** for `cloudflare`
   (Cloudflare dashboard, zone Overview page, right sidebar).
-- `proxied` applies to `cloudflare` only. A proxied record is forced to Cloudflare's
-  automatic TTL; the `ttl` value is ignored.
+- `ttl` is used by `gcp`. On `cloudflare` the record keeps the TTL the zone already has.
 
 The trailing dot in `record_name` is required by Google Cloud DNS. The Cloudflare client
 strips it, so one record name format works for both.
@@ -42,7 +40,21 @@ strips it, so one record name format works for both.
 `provider` is mandatory on every entry. A missing or unrecognized value stops the tool at
 startup rather than skipping the record, so a typo cannot go unnoticed.
 
-If a record does not exist in the zone yet, both providers create it.
+`record_type` must be `A` or `AAAA`. The address family follows from it: the external IP for
+an `A` record is fetched over IPv4 and for an `AAAA` record over IPv6, so a dual-stack host
+publishes the right address for each.
+
+## What the updater owns
+
+On `cloudflare` the updater changes **only the value** of a record:
+
+- It sends a content-only `PATCH`. TTL and the proxy setting stay as the zone has them, so a
+  system that manages the zone (Terraform, for instance) keeps ownership of those fields.
+- It does not create records. A missing record is reported as an error every cycle, because
+  an absent record is a fault to report and not a condition to repair.
+
+On `gcp` the updater writes a full record set and creates the record if it is absent, which
+is inherent to how the Cloud DNS change API is used.
 
 > **Migrating an older `domains.json`:** earlier versions wrote PascalCase keys (`"ZoneName"`)
 > which never matched the documented snake_case format. Rename the keys as shown above and add
@@ -76,7 +88,16 @@ export CLOUDFLARE_API_TOKEN=...
 go run .
 ```
 
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-config` | `domains.json` | Path to the configuration file |
+| `-interval` | `5m` | How often to check the external IP |
+
+The tool runs until stopped. It reads its configuration once, at startup.
+
 ## Limitations
 
 Each record is treated as holding a single IP. Where a name has several values, only the first
 is read and updated.
+
+The configuration is read once at startup. Editing `domains.json` needs a restart.

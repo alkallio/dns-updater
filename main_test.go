@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // TestIsValidIP tests IP address validation
@@ -316,35 +319,15 @@ func TestCloudflareRecordName(t *testing.T) {
 	}
 }
 
-// TestCloudflareTTL checks that proxied records force the automatic TTL.
-func TestCloudflareTTL(t *testing.T) {
-	tests := []struct {
-		name string
-		rec  DomainConfig
-		want int64
-	}{
-		{"explicit TTL", DomainConfig{TTL: 300}, 300},
-		{"proxied forces auto", DomainConfig{TTL: 300, Proxied: true}, cloudflareAutoTTL},
-		{"zero TTL means auto", DomainConfig{TTL: 0}, cloudflareAutoTTL},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := cloudflareTTL(tt.rec); got != tt.want {
-				t.Errorf("cloudflareTTL() = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
 // TestDomainConfigJSONTags verifies that the snake_case keys documented in the
 // README actually populate the struct.
 func TestDomainConfigJSONTags(t *testing.T) {
-	input := []byte(`{"provider":"cloudflare","zone_name":"abc123","record_name":"sub.example.com.","record_type":"A","ttl":300,"proxied":true}`)
+	input := []byte(`{"provider":"cloudflare","zone_name":"abc123","record_name":"sub.example.com.","record_type":"A","ttl":300}`)
 	var got DomainConfig
 	if err := json.Unmarshal(input, &got); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	want := DomainConfig{Provider: "cloudflare", ZoneName: "abc123", RecordName: "sub.example.com.", RecordType: "A", TTL: 300, Proxied: true}
+	want := DomainConfig{Provider: "cloudflare", ZoneName: "abc123", RecordName: "sub.example.com.", RecordType: "A", TTL: 300}
 	if got != want {
 		t.Errorf("parsed %+v, want %+v", got, want)
 	}
@@ -422,5 +405,104 @@ func TestBuildUpdatersCloudflareOnly(t *testing.T) {
 	}
 	if _, ok := updaters[ProviderCloudflare]; !ok {
 		t.Error("cloudflare client should be initialized")
+	}
+}
+
+// TestNetworkForRecordType checks the record type to address family mapping.
+func TestNetworkForRecordType(t *testing.T) {
+	tests := []struct {
+		recordType string
+		want       string
+		wantError  bool
+	}{
+		{"A", "tcp4", false},
+		{"AAAA", "tcp6", false},
+		{"CNAME", "", true},
+		{"", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.recordType, func(t *testing.T) {
+			got, err := networkForRecordType(tt.recordType)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("networkForRecordType(%q) error = %v, wantError %v", tt.recordType, err, tt.wantError)
+			}
+			if got != tt.want {
+				t.Errorf("networkForRecordType(%q) = %q, want %q", tt.recordType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMatchesRecordType guards the defect where an IPv6 address reached an A
+// record because isValidIP accepts both families.
+func TestMatchesRecordType(t *testing.T) {
+	tests := []struct {
+		ip         string
+		recordType string
+		want       bool
+	}{
+		{"1.2.3.4", "A", true},
+		{"2001:db8::1", "AAAA", true},
+		{"2001:db8::1", "A", false},
+		{"1.2.3.4", "AAAA", false},
+		{"not-an-ip", "A", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.ip+"/"+tt.recordType, func(t *testing.T) {
+			if got := matchesRecordType(tt.ip, tt.recordType); got != tt.want {
+				t.Errorf("matchesRecordType(%q, %q) = %v, want %v", tt.ip, tt.recordType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetExternalIPRejectsWrongFamily verifies that a source reporting the
+// wrong family is skipped rather than written into the record.
+func TestGetExternalIPRejectsWrongFamily(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "2001:db8::1")
+	}))
+	defer server.Close()
+
+	fetcher := &HTTPIPFetcher{URLs: []string{server.URL}, Timeout: 5 * time.Second}
+	if _, err := fetcher.GetExternalIP("A"); err == nil {
+		t.Error("an IPv6 answer must not satisfy an A record")
+	}
+}
+
+// TestGetExternalIPUnsupportedType verifies that a record type with no address
+// family is rejected before any request is made.
+func TestGetExternalIPUnsupportedType(t *testing.T) {
+	fetcher := &HTTPIPFetcher{URLs: []string{"http://127.0.0.1:1"}}
+	if _, err := fetcher.GetExternalIP("MX"); err == nil {
+		t.Error("GetExternalIP should reject a record type that holds no IP address")
+	}
+}
+
+// TestFetchIPFromTrace checks parsing of the Cloudflare trace key=value format.
+func TestFetchIPFromTrace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "fl=123abc\nh=cloudflare.com\nip=203.0.113.7\nts=1234.5\n")
+	}))
+	defer server.Close()
+
+	got, err := fetchIPFrom(server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("fetchIPFrom() error = %v", err)
+	}
+	if got != "203.0.113.7" {
+		t.Errorf("fetchIPFrom() = %q, want %q", got, "203.0.113.7")
+	}
+}
+
+// TestFetchIPFromRejectsError checks that a non-200 response is an error.
+func TestFetchIPFromRejectsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	if _, err := fetchIPFrom(server.Client(), server.URL); err == nil {
+		t.Error("fetchIPFrom should reject a non-200 response")
 	}
 }
